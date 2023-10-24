@@ -9,8 +9,34 @@
 #include <HTTPClient.h>
 #include <NTPClient.h>
 
+// JFC - yet another Arduino treasure hunt
+// The fonts in Adafruit_GFX library are named exactly the same as in the TFT_eSPI lib, but they are NOT the same or compatible
+// (despite compiling without error, you will get garbage using either the tft.printx functions or e.g. the GFXcanvas.printx functions)
+// The flicker-free-ish built in fonts of the TFT_eSPI lib are ugly and buggy
+// The FreeFonts (in the TFT lib) are prettier, but need to be "erased" for in-place updates which causes flicker
+//
+// So, basically everything needs to be rendered in a bitmap first then updated to screen (no tft.printx for you!)
+//
+// Also. The performance of the Pico W and Waveshare ResTouch 3.5" LCD is not spectacular - about 500 ms to clear the screen
+// See this discussion about the hobbled design of the LCD board https://github.com/Bodmer/TFT_eSPI/discussions/1554 
+// for this reason I implemented deferred drawing of the bitmaps so the touch button would respond reasonably well
+
 #include <SPI.h>
+#include <Adafruit_GFX.h>
+#include "Fonts/FreeSerif9pt7b.h"
+#include "Fonts/FreeMonoBold9pt7b.h"
+#include "Fonts/FreeMonoBold24pt7b.h"
+#include "Fonts/FreeMonoBold18pt7b.h"
+#include "Fonts/FreeMonoBold12pt7b.h"
 #include <TFT_eSPI.h>
+#include <hardware/pwm.h>
+#include <elapsedMillis.h>
+#include <ArduinoJson.h>
+
+// Backlight update = 133 MHz/(255*2360) = 221 Hz
+#define BACKLIGHT_DIV 255
+#define BACKLIGHT_TOP 2360
+#define MIN_SCREEN_LEVEL 100
 
 //
 // Another Arduino Treasure Hunt:
@@ -20,11 +46,15 @@
 // Replace the Setup60_RP2040_ILI9341.h in the libraries/TFT_eSPI/User_Setups folder with the downloaded version
 // Hand-edit Setup60_RP2040_ILI9341.h for:
 // Uncomment  #define TFT_INVERSION_ON
+// #define TFT_SPI_PORT 1 (for the Waveshare 3.5 ResTouch/Pico W combo) 
 // Leave the ILI9488_DRIVER uncommented - this seems to work 
+// change SPI_FREQUENCY to 70000000 - seemed to speed up display
 
 TFT_eSPI tft = TFT_eSPI();
+uint8_t backlight_pwm_slice;
+TFT_eSPI_Button details_button = TFT_eSPI_Button();
+TFT_eSPI_Button history_button = TFT_eSPI_Button();
 
-// FIXME: Put in separate, untracked file
 int status = WL_IDLE_STATUS;     // the Wifi radio's status
 
 WiFiUDP ntpUDP;
@@ -71,14 +101,14 @@ NTPClient timeClient(ntpUDP);
 const int16_t MB[13] = {0,31,59,90,120,151,181,212,243,273,304,334,365};
 const int16_t MB_LY[13] = {0,31,60,91,121,152,182,213,244,274,305,335,366};
 const int16_t *month_boundaries;
-const String WeekDays[7] = {"Thu","Fri","Sat","Sun","Mon","Tue","Wed"};
-const String Months[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+const char WeekDays[][4] = {"Thu","Fri","Sat","Sun","Mon","Tue","Wed"};
+const char Months[][4] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
 
 // offset without DST
 static int16_t timezone_minutes = -8*60; // Pacific standard time; will adjust for DST below
 static int16_t dst_clockchange_minutes = 60; // "Spring ahead, fall back"
 
-const String timezone_strings[2] = {"PST","PDT"};
+const char timezone_strings[][4] = {"PST","PDT"};
 static int16_t current_year = 0; // gets set on first call
 
 static uint32_t dst_start_utctimestamp=0; // for this year
@@ -161,7 +191,10 @@ uint32_t get_year_from_days(uint32_t D) {
   return(Y);
 }
 
-String get_date(uint32_t inputSecs = 0) {
+char time_cstring[] = "00 : 00 : 00 AM PST";
+char date_cstring[] = "MON JAN XX, 2023";
+
+void get_date(uint32_t inputSecs = 0) {
 
   timeClient.update();
 
@@ -185,7 +218,7 @@ String get_date(uint32_t inputSecs = 0) {
     current_year = Y; // keep track of last date request year
   }
   // check for DST - this never affects Y
-  String dst_name = timezone_strings[0];
+  const char* dst_name = timezone_strings[0];
   if ((epochSecs > dst_start_utctimestamp)&&(epochSecs < dst_end_utctimestamp)) 
   {
     current_offset_minutes = timezone_minutes + dst_clockchange_minutes;
@@ -229,76 +262,16 @@ String get_date(uint32_t inputSecs = 0) {
     hours = 12; // convention
   }
 
-  String f_hours = (hours >= 10)?String(hours):" "+String(hours);
-  String f_minutes = (minutes >= 10)?String(minutes):"0"+String(minutes);
-  String f_seconds = (seconds >= 10)?String(seconds):"0"+String(seconds);
-  String time_string = f_hours + " : " + f_minutes + " : " + f_seconds + " " + String(ampm) + " " + dst_name;
-  String date_string = WeekDays[day_of_week_idx] + " " + Months[month_idx] + " " + String(day_of_month) + ", " + String(current_year);
+  sprintf(time_cstring,"%2d:%02d:%02d %s %s",hours,minutes,seconds,ampm,dst_name);
+  sprintf(date_cstring,"%s %s %2d, %4d", WeekDays[day_of_week_idx], Months[month_idx], day_of_month, current_year);
 
-  return(date_string + " " + time_string);
+//  String f_hours = (hours >= 10)?String(hours):" "+String(hours);
+//  String f_minutes = (minutes >= 10)?String(minutes):"0"+String(minutes);
+//  String f_seconds = (seconds >= 10)?String(seconds):"0"+String(seconds);
+//  String time_string = f_hours + " : " + f_minutes + " : " + f_seconds + " " + String(ampm) + " " + dst_name;
+//  String date_string = WeekDays[day_of_week_idx] + " " + Months[month_idx] + " " + String(day_of_month) + ", " + String(current_year);
 
-}
-
-void setup() {
- 
-  // blink once when setup begins
-  digitalWrite(PIN_LED, HIGH);
-  delay(100);
-  digitalWrite(PIN_LED, LOW);
-  delay(100);
-
-// nothing was coming out of pins from scope so had to do this manually
-  gpio_set_function(TFT_CS, GPIO_FUNC_SPI);
-  gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI);
-  gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI);
-  gpio_set_function(TFT_MISO, GPIO_FUNC_SPI);
-  // can use PWM on this pin to dim screen - TODO
-  pinMode(TFT_BL, OUTPUT);
-
-  tft.init();
-
-  tft.setRotation(2);
-  tft.fillScreen((TFT_BLACK));
-
-
-//  tft.setCursor(20, 0, 2);
-  tft.setTextColor(TFT_BLUE);  
-  tft.setFreeFont(&FreeSerif9pt7b);
-//  tft.setTextSize(1);
-  tft.println(" ");
-  tft.println("Hello!");
-
-  tft.setTextColor(TFT_GREEN); 
-  tft.println("Hello!");
-
-  tft.setTextColor(TFT_RED); 
-  tft.println("Hello!");
-
-  tft.setTextColor(TFT_WHITE);
-  tft.println("Connecting"); 
-  while (status != WL_CONNECTED) {
-    // Connect to WPA/WPA2 network:
-    status = WiFi.begin(local_ssid,local_pass);
-    tft.print('.');
-    // wait 3 seconds for connection:
-    delay(3000);
-  }
-
-  // now attempt to use NTP client to set time!
-  timeClient.begin();
-  timeClient.update();
-  timeClient.setUpdateInterval(1000*3600); // once an hour should be good enough
-
-  // x0,x1,y0,y1,ctl = [bits from LSB: 1=rotate,2=invertx,3=inverty]
-  // NOTE: Calibration values are RAW extent values - which are between ~300-3600 in both X and Y
-  uint16_t calibrationData[5] = {300,3600,300,3600,0};
-  tft.setTouch(calibrationData);
-
-  initial_screen();
-  delay(5000);
-  tft.fillScreen(TFT_BLACK);
-  tft.setCursor(0,0);
-  tft.println("");
+//  return(date_string + " | " + time_string);
 
 }
 
@@ -307,6 +280,7 @@ void initial_screen() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_GREEN);
   tft.setTextWrap(true);
+  tft.setTextSize(1);
   tft.setCursor(0,0);
   tft.println(""); // cursor is at bottom of font
   tft.println("Connected!");
@@ -338,12 +312,7 @@ void initial_screen() {
     http.end();
   }
 
-  String date_string = get_date();
-  Serial.println(date_string);
-  tft.println(date_string);
-
 }
-
 
 static uint32_t color = 0xFFFF;
 #define MAXLINES 16
@@ -368,35 +337,513 @@ static uint32_t test_times[MAXLINES] = {
   ((2025-1970)*365+14 + 365)*3600*24 + 8*3600-1 // Dec 31 2025, PST
 };
 
+
+void draw_message(const char* e) {
+//  tft.setCursor(5, 430, 2);
+//  tft.setTextFont(2);
+//  tft.setTextColor(TFT_RED, TFT_LIGHTGREY,true);  
+//  tft.fillRect(0, 425, 175, 40, TFT_DARKGREY);
+//  tft.println(e);
+}
+
+elapsedMillis performance_millis;
+
+enum GIZMO_STATES {
+  STATE_SLEEP,
+  STATE_UPDATE,
+  STATE_UPDATE_WEB,
+  STATE_DIMMING,
+  STATE_SHOW_FORECAST,
+  STATE_SHOW_HISTORY,
+  STATE_WAIT
+};
+
+uint8_t gizmo_state;
+
+elapsedMillis awake_millis;
+elapsedMillis update_millis;
+elapsedMillis web_millis;
+
+uint32_t awake_delay = 60*1000; // ms
+uint32_t update_delay = 2*1000; // ms, for raw sensor data
+uint32_t web_delay = 10*1000; // ms, update forecast, etc; make longer
+
+uint8_t dimming_interval = 10; // ms
+uint8_t dimming_levels = 100; // linear walk-down of screen brightness 
+
+enum BITMAP_NAMES {
+  DATE_CANVAS,
+  T_CANVAS,
+  H_CANVAS,
+  WINDV_CANVAS,
+  WINDA_CANVAS,
+  PRECIP_CANVAS,
+  NUM_BITMAPS
+};
+
+// render bitmaps one at a time during sleep state - it is slow!
+bool dirty[NUM_BITMAPS]; 
+
+int bpos[][4] = {
+  {0,0,320,50}, // x, y, w, h; date
+  {0,70,320,50}, // temp
+  {0,120,320,50}, // hum
+  {0,200,320,55}, // wind v
+  {0,255,320,50}, // wind angle
+  {0,340,320,55} // precip
+};
+
+int canvas_colors[][2] = {
+  {TFT_SKYBLUE,TFT_BLACK},
+  {TFT_GREEN,TFT_BLACK},
+  {TFT_GREEN,TFT_BLACK},
+  {TFT_GREEN,0x01},
+  {TFT_GREEN,0x01},
+  {TFT_GREEN,0x01}
+};
+
+float wind_angle_breaks[][2] = {
+  {0, 22.5}, // N
+  {22.5, 67.5}, // NE
+  {67.5, 112.5}, // E
+  {112.5, 157.5}, // SE
+  {157.5, 202.5}, // S
+  {202.5, 247.5}, // SW
+  {247.5, 292.5}, // W
+  {292.5, 337.5}, // NW
+  {337.5, 360} // N
+};
+
+char wind_angle_labels[][3] = {
+  " N",
+  "NE",
+  " E",
+  "SE",
+  " S",
+  "SW",
+  " W",
+  "NW",
+  " N"
+};
+
+GFXcanvas1 *canvases[NUM_BITMAPS]; 
+#define MAX_FORECAST_LEN 256
+char forecasts[8][MAX_FORECAST_LEN];
+#define MAX_HISTORY_LEN 128
+char history_data[8][MAX_HISTORY_LEN];
+
+void setup() {
+ 
+  // blink once when setup begins
+  digitalWrite(PIN_LED, HIGH);
+  delay(100);
+  digitalWrite(PIN_LED, LOW);
+  delay(100);
+
+// nothing was coming out of pins from scope so had to do this manually
+  gpio_set_function(TFT_CS, GPIO_FUNC_SPI);
+  gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI);
+  gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI);
+  gpio_set_function(TFT_MISO, GPIO_FUNC_SPI);
+
+
+  tft.init();
+
+  // can use PWM on this pin to dim screen - TODO
+  pinMode(TFT_BL, OUTPUT); // GPIO13 = PWM 6B 
+  gpio_set_function(TFT_BL, GPIO_FUNC_PWM);
+  backlight_pwm_slice = pwm_gpio_to_slice_num(TFT_BL);
+  pwm_config backlightConfig = pwm_get_default_config();
+  pwm_config_set_wrap(&backlightConfig, BACKLIGHT_TOP); // with 255 prescaling, gets to 220 Hz  
+  pwm_init(backlight_pwm_slice, &backlightConfig, true);
+  pwm_set_chan_level(backlight_pwm_slice, 1, BACKLIGHT_TOP/2); // initial value
+  pwm_set_clkdiv_int_frac(backlight_pwm_slice, BACKLIGHT_DIV, 0); // 133 MHz/255 = 521.6 kHz clock freq
+
+  tft.setRotation(2);
+  tft.fillScreen((TFT_BLACK));
+
+
+// DO NOT use the Adafruit_GFX fonts! 
+//  tft.setFreeFont(&FreeSerif9pt7b); 
+  tft.setTextFont(2);
+  tft.setTextSize(2);
+
+//  tft.setCursor(20, 0, 2);
+  tft.setTextColor(TFT_SKYBLUE);
+  tft.println(" ");
+  tft.println("Hello!");
+
+  tft.setTextColor(TFT_GREEN); 
+  tft.println("Hello!");
+
+  tft.setTextColor(TFT_RED); 
+  tft.println("Hello!");
+  
+  tft.setTextColor(TFT_WHITE);
+  tft.println("Connecting"); 
+  while (status != WL_CONNECTED) {
+    // Connect to WPA/WPA2 network:
+    status = WiFi.begin(local_ssid,local_pass);
+    tft.print('.');
+    // wait 3 seconds for connection:
+    delay(3000);
+  }
+
+  // now attempt to use NTP client to set time!
+  timeClient.begin();
+  timeClient.update();
+  timeClient.setUpdateInterval(1000*3600); // once an hour should be good enough
+
+  // x0,x1,y0,y1,ctl = [bits from LSB: 1=rotate,2=invertx,3=inverty]
+  // NOTE: Calibration values are RAW extent values - which are between ~300-3600 in both X and Y
+  uint16_t calibrationData[5] = {300,3600,300,3600,0};
+  tft.setTouch(calibrationData);
+
+  initial_screen();
+  delay(5000);
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(0,0);
+  tft.println("");
+
+  update_millis = 0;
+  web_millis = 0;
+  awake_millis = 0;
+  pwm_set_chan_level(backlight_pwm_slice, 1, BACKLIGHT_TOP);
+
+  char blabel[] = "Forecast"; 
+  details_button.initButton(&tft,250,450,120,50,TFT_SKYBLUE,TFT_BLACK,TFT_SKYBLUE,blabel,2);
+  details_button.drawButton();
+
+  char hlabel[] = "History"; 
+  history_button.initButton(&tft,70,450,120,50,TFT_SKYBLUE,TFT_BLACK,TFT_SKYBLUE,hlabel,2);
+  history_button.drawButton();
+
+  // allocate canvases for rendering
+  for (int i=0; i < NUM_BITMAPS; ++i) {
+    canvases[i] = new GFXcanvas1(bpos[i][2],bpos[i][3]);
+  }
+
+
+}
+
 void loop() {
 
   uint16_t x, y;
   static uint16_t color = TFT_WHITE;
+  static int16_t screen_level = BACKLIGHT_TOP;
 
-  if (maxlines > 0) {
-    digitalWrite(PIN_LED, HIGH);
-    tft.setTextColor(color, TFT_WHITE);  
-    color = color - 128;
-    tft.println(get_date(test_times[MAXLINES-maxlines]));
-    maxlines--;
-    delay(50);
-    digitalWrite(PIN_LED, LOW);
-    delay(50);
+  if (tft.getTouch(&x, &y)) {
+    awake_millis=0; // reset awake timer
+    // do other stuff with x, y position
+    screen_level = BACKLIGHT_TOP;
+
+    if (details_button.contains(x,y)) {
+      if (!details_button.isPressed()) {
+        details_button.press(true); 
+        details_button.drawButton(true);
+        gizmo_state = STATE_SHOW_FORECAST;
+      }
+    }
+    else if (history_button.contains(x,y)) {
+      if (!history_button.isPressed()) {
+        history_button.press(true); 
+        history_button.drawButton(true);
+        gizmo_state = STATE_SHOW_HISTORY;
+      }
+    }
+    else {
+      if (details_button.isPressed() || history_button.isPressed()) {
+        if (gizmo_state == STATE_WAIT || gizmo_state == STATE_DIMMING || gizmo_state == STATE_SLEEP) {
+          tft.fillScreen(TFT_BLACK);
+        }
+        details_button.press(false);
+        details_button.drawButton();
+        history_button.press(false);
+        history_button.drawButton();
+        gizmo_state = STATE_UPDATE;
+      }
+    }
   }
-  else if (tft.getTouch(&x, &y)) {
-    tft.setTextColor(TFT_GREEN, TFT_BLACK,true);  
-
-    tft.fillRect(5, 385,150,17,TFT_BLACK);
-    tft.setCursor(5, 400, 2);
-    tft.printf("x: %i     ", x);
-
-    tft.fillRect(5, 405,150,17,TFT_BLACK);
-    tft.setCursor(5, 420, 2);
-    tft.printf("y: %i    ", y);
-
-    tft.drawCircle(x, y, 5, TFT_GREEN);
+  else if (awake_millis > awake_delay) {
+      gizmo_state = STATE_DIMMING;
+      if (screen_level <=0) {
+        if(gizmo_state != STATE_WAIT) {
+          gizmo_state = STATE_SLEEP;
+        }
+      }
+  }
+  else if (update_millis > update_delay && gizmo_state != STATE_WAIT) {
+      gizmo_state = STATE_UPDATE;
+      update_millis = 0;
+  }
+  else if (web_millis > web_delay && gizmo_state != STATE_WAIT) {
+      gizmo_state = STATE_UPDATE_WEB;
+      web_millis = 0;
+  }
+  else if(gizmo_state != STATE_WAIT) {
+    gizmo_state = STATE_SLEEP;
   }
 
+  // do stuff for machine state
+  switch (gizmo_state) {
+    case STATE_DIMMING:
+      screen_level-=(BACKLIGHT_TOP/dimming_levels);
+      if (screen_level > MIN_SCREEN_LEVEL) {
+        pwm_set_chan_level(backlight_pwm_slice, 1, screen_level);
+        delay(dimming_interval);
+      }
+      break;    
+    case STATE_UPDATE:
+    { // note locally declared variables requiring scope
+      // turn screen back on
+      performance_millis = 0;
 
+      pwm_set_chan_level(backlight_pwm_slice, 1, BACKLIGHT_TOP-1);
+
+      // update date/time first
+      get_date();
+
+      canvases[DATE_CANVAS]->fillScreen(TFT_BLACK);
+      canvases[DATE_CANVAS]->setFont(&FreeMonoBold12pt7b);
+      canvases[DATE_CANVAS]->setCursor(30, 16);
+      canvases[DATE_CANVAS]->printf("%s\n",date_cstring);
+      int16_t ycur = canvases[DATE_CANVAS]->getCursorY();
+      canvases[DATE_CANVAS]->setCursor(0, ycur+5);
+      canvases[DATE_CANVAS]->setFont(&FreeMonoBold18pt7b);
+      canvases[DATE_CANVAS]->printf("%s",time_cstring);
+      dirty[DATE_CANVAS]=true;
+ 
+      HTTPClient http;
+      String sensor_string = "";
+      if (http.begin(data_url)) {
+        if (http.GET() > 0) {
+            sensor_string = http.getString();
+        }
+        http.end();
+      }
+//      const int json_cap = 11*JSON_OBJECT_SIZE(3) + JSON_OBJECT_SIZE(11);
+//      StaticJsonDocument<json_cap> doc;
+      DynamicJsonDocument doc(1024); // just set to 1k buffer
+      DeserializationError err = deserializeJson(doc,sensor_string.c_str());
+      
+      if(err) {
+          draw_message(err.c_str());
+      }
+
+      if(!doc["wind_angle"]["reading"].isNull() && !doc["wind_vmph"]["reading"].isNull()) {
+        float wind_angle = doc["wind_angle"]["reading"];
+        float wind_vmph = doc["wind_vmph"]["reading"];
+
+        int widx = -1; 
+        for (int i=0; i < 9; ++i) {
+          if (wind_angle >= wind_angle_breaks[i][0] && wind_angle < wind_angle_breaks[i][1]) {
+            widx = i;
+            break;
+          }
+        }
+        char angle_dir[] = "XX";
+        if (widx >= 0) {
+          strncpy(angle_dir,wind_angle_labels[widx],2);
+        }
+
+        canvases[WINDV_CANVAS]->fillScreen(TFT_BLACK);
+        canvases[WINDV_CANVAS]->setFont(&FreeMonoBold9pt7b);
+        canvases[WINDV_CANVAS]->setCursor(90, 11);
+        canvases[WINDV_CANVAS]->printf("WIND GAUGE");           
+        canvases[WINDV_CANVAS]->setCursor(5, 50);
+        canvases[WINDV_CANVAS]->setFont(&FreeMonoBold24pt7b);
+        canvases[WINDV_CANVAS]->printf("%3.1f mph",wind_vmph);
+        dirty[WINDV_CANVAS]=true;
+  
+        canvases[WINDA_CANVAS]->fillScreen(TFT_BLACK);
+        canvases[WINDA_CANVAS]->setCursor(5, 40);
+        canvases[WINDA_CANVAS]->setFont(&FreeMonoBold24pt7b);
+        canvases[WINDA_CANVAS]->printf("%s (%3.1f)", angle_dir, wind_angle);
+        dirty[WINDA_CANVAS]=true;
+      }
+
+      if(!doc["outside_T"]["reading"].isNull() && !doc["outside_H"]["reading"].isNull()) {
+        float outside_T = doc["outside_T"]["reading"];
+        float outside_H = doc["outside_H"]["reading"];
+
+        canvases[T_CANVAS]->fillScreen(TFT_BLACK);
+        canvases[T_CANVAS]->setFont(&FreeMonoBold24pt7b);
+        canvases[T_CANVAS]->setCursor(5, 40);
+        canvases[T_CANVAS]->printf("T(F) %3.1f",9*outside_T/5+32);
+        dirty[T_CANVAS]=true;
+
+        canvases[H_CANVAS]->fillScreen(TFT_BLACK);
+        canvases[H_CANVAS]->setFont(&FreeMonoBold24pt7b);
+        canvases[H_CANVAS]->setCursor(5, 40);
+        canvases[H_CANVAS]->printf("H(%%) %3.1f",outside_H);
+        dirty[H_CANVAS]=true;
+      }
+
+      char mbuf[] = "0000000000 ms ";
+      uint32_t bval = performance_millis;
+      sprintf(mbuf,"%d ms",bval);
+      draw_message(mbuf);
+      break;
+
+    }
+
+    case STATE_UPDATE_WEB:
+    {
+      HTTPClient http;
+      String micro_string = "";
+      if (http.begin(micro_url)) {
+        if (http.GET() > 0) {
+            micro_string = http.getString();
+        }
+        http.end();
+      }
+      DynamicJsonDocument doc(3072); // set to 3k buffer
+      DeserializationError err = deserializeJson(doc,micro_string.c_str());
+      
+      if(err) {
+          draw_message(err.c_str());
+          break;
+      }
+
+      if( !doc["max_temp_24hr"].isNull() && !doc["min_temp_24hr"].isNull()) {
+        const char* max_temp_24hr = doc["max_temp_24hr"];
+        const char* min_temp_24hr = doc["min_temp_24hr"];
+        sprintf(history_data[0],"Max/Min Temp (24 hr):\n  %s / %s",max_temp_24hr,min_temp_24hr);
+      }
+      if (!doc["max_humidity_24hr"].isNull() && !doc["min_humidity_24hr"].isNull()) {
+        const char* max_humidity_24hr = doc["max_humidity_24hr"];
+        const char* min_humidity_24hr = doc["min_humidity_24hr"];
+        sprintf(history_data[1],"Max/Min Hum (24 hr):\n  %s / %s\n",max_humidity_24hr,min_humidity_24hr);
+      }
+
+      if (!doc["vmph_max_24hr"].isNull() && !doc["vmph_1m"].isNull()) {
+        const char* vmph_max_24hr = doc["vmph_max_24hr"];
+        const char* vmph_1m = doc["vmph_1m"];
+        sprintf(history_data[2],"Max Wind (1 min/24 hr):\n  %s / %s",vmph_1m,vmph_max_24hr);
+      }
+      if (!doc["nicedt_vmph_max_24hr"].isNull()) {
+        const char* vmph_max_24hr_dt = doc["nicedt_vmph_max_24hr"];
+        sprintf(history_data[3],"Max Wind (24 hr):\n %s",vmph_max_24hr_dt);
+      }
+
+      if (!doc["dir_med_24hr"].isNull() && !doc["dir_med_1m"].isNull()) {
+        const char* dir_med_24hr = doc["dir_med_24hr"];
+        const char* dir_med_1m = doc["dir_med_1m"];
+        sprintf(history_data[4],"Wind Dir (1 min/24 hr):\n %s/%s",dir_med_1m,dir_med_24hr);
+      }
+
+      if (!doc["vmph_max_record"].isNull() && !doc["nicedt_vmph_record"].isNull()) {
+        const char* vmph_max_record = doc["vmph_max_record"];
+        const char* vmph_max_record_dt = doc["nicedt_vmph_record"];
+        sprintf(history_data[5],"Record Wind Gust:\n %s/%s\n",vmph_max_record,(vmph_max_record_dt+2));
+      }
+
+      if (!doc["precipytd_in"].isNull()) {
+        const char* precipytd_in = doc["precipytd_in"];
+        sprintf(history_data[6],"Precip for Year:\n  %s",precipytd_in);
+      }
+
+      char tag[] = "Forecastx";
+      for (int i=0; i < 8; ++i) {
+        sprintf(tag,"Forecast%d",i);
+        if(!doc[tag].isNull()) {
+          const char* f0 = doc[tag];
+          strncpy(forecasts[i], f0, MAX_FORECAST_LEN-1);
+        }
+        else {
+          strncpy(forecasts[i],"", MAX_FORECAST_LEN-1);
+        }
+ 
+      }
+
+      canvases[PRECIP_CANVAS]->fillScreen(TFT_BLACK);
+      canvases[PRECIP_CANVAS]->setFont(&FreeMonoBold9pt7b);
+      canvases[PRECIP_CANVAS]->setCursor(90, 11);
+      canvases[PRECIP_CANVAS]->printf("PRECIP (hr/day)");
+      canvases[PRECIP_CANVAS]->setFont(&FreeMonoBold18pt7b);
+      canvases[PRECIP_CANVAS]->setCursor(5, 48);
+      if (!doc["precip_inphr"]["reading"].isNull() && !doc["dailyprecip_in"]["reading"].isNull()) {
+        float precip_inphr = doc["precip_inphr"]["reading"];
+        float dailyprecip_in = doc["dailyprecip_in"]["reading"];
+        canvases[PRECIP_CANVAS]->printf("%.1f in/%.1f in",precip_inphr,dailyprecip_in);
+      }
+
+      dirty[PRECIP_CANVAS]=true;
+
+
+
+      break;
+
+    }
+    case STATE_SHOW_FORECAST:
+    {
+      tft.fillRect(0, 0, 320, 450, TFT_BLACK);
+      tft.setCursor(0,0);
+      GFXcanvas1 forecast_canvas(320,450);
+      forecast_canvas.setFont(&FreeSerif9pt7b);
+      forecast_canvas.setCursor(0, 17);
+      forecast_canvas.println(forecasts[0]);
+      forecast_canvas.println("");
+      forecast_canvas.println(forecasts[1]);
+      forecast_canvas.println("");
+      forecast_canvas.println(forecasts[2]);
+      tft.drawBitmap(0,0,forecast_canvas.getBuffer(),320,450,TFT_CYAN,TFT_BLACK);
+      // have to transition here
+      gizmo_state = STATE_WAIT;
+      break;
+    }
+    case STATE_SHOW_HISTORY:
+    {
+      tft.fillRect(0, 0, 320, 450, TFT_BLACK);
+      tft.setCursor(0,0);
+      GFXcanvas1 history_canvas(320,450);
+      history_canvas.setFont(&FreeMonoBold12pt7b);
+      history_canvas.setCursor(0, 17);
+      for (int i=0; i < 7; ++i) {
+        history_canvas.printf("%s\n",history_data[i]);
+      }
+      tft.drawBitmap(0,0,history_canvas.getBuffer(),320,450,TFT_CYAN,TFT_BLACK);
+      // have to transition here
+      gizmo_state = STATE_WAIT;
+      break;
+    }
+    case STATE_WAIT:
+      break;
+    case STATE_SLEEP:
+      for (int i=0; i < NUM_BITMAPS; ++i) {
+        if (dirty[i]) {
+          dirty[i]=false;
+          tft.drawBitmap(bpos[i][0],bpos[i][1],canvases[i]->getBuffer(),bpos[i][2],bpos[i][3],canvas_colors[i][0],canvas_colors[i][1]);
+          break; // only do first one
+        }
+      }
+      break;
+  }
+//  if (maxlines > 0) {
+//    digitalWrite(PIN_LED, HIGH);
+//    tft.setTextColor(color, TFT_WHITE);  
+//    color = color - 128;
+//    tft.println(get_date(test_times[MAXLINES-maxlines]));
+//    pwm_set_chan_level(backlight_pwm_slice, 1, BACKLIGHT_TOP/maxlines); 
+//    maxlines--;
+//    delay(100);
+//    digitalWrite(PIN_LED, LOW);
+//    delay(100);
+
+//  }
+//  else if (tft.getTouch(&x, &y)) {
+//    tft.setTextColor(TFT_GREEN, TFT_BLACK,true);  
+
+//    tft.fillRect(5, 385,150,17,TFT_BLACK);
+//    tft.setCursor(5, 400, 2);
+//    tft.printf("x: %i     ", x);
+
+//    tft.fillRect(5, 405,150,17,TFT_BLACK);
+//    tft.setCursor(5, 420, 2);
+//    tft.printf("y: %i    ", y);
+
+//    tft.drawCircle(x, y, 5, TFT_GREEN);
+
+//  }
 
 }
