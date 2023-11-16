@@ -762,10 +762,10 @@ void loop() {
       canvases[PRECIP_CANVAS]->printf("PRECIP (hr/day)");
       canvases[PRECIP_CANVAS]->setFont(&FreeMonoBold18pt7b);
       canvases[PRECIP_CANVAS]->setCursor(5, 48);
-      if (!doc["precip_inphr"]["reading"].isNull() && !doc["dailyprecip_in"]["reading"].isNull()) {
+      if (!doc["precip_inphr"]["reading"].isNull() && !doc["precip_24hr"].isNull()) {
         float precip_inphr = doc["precip_inphr"]["reading"];
-        float dailyprecip_in = doc["dailyprecip_in"]["reading"];
-        canvases[PRECIP_CANVAS]->printf("%.1f in/%.1f in",precip_inphr,dailyprecip_in);
+        const char* precip_24hr = doc["precip_24hr"];
+        canvases[PRECIP_CANVAS]->printf("%.2f in/%s in",precip_inphr,precip_24hr);
       }
 
       dirty[PRECIP_CANVAS]=true;
