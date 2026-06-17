@@ -1,14 +1,19 @@
 
 #include <WiFi.h>
-// secret, contains definition of local_ssid, local_pass, and micro_url in three lines, literally: 
+// secret, contains definition of local_ssid, local_pass, and microd_url/microf_url , literally: 
 // char local_ssid[] = "NNN";  //  your network SSID (name)
 // char local_pass[] = "PPP";  // your network password
-// char micro_url[] = "http://your-data-endpoint/";
-#include "/home/jmoon/Arduino/libraries/local/ssid_coleman.h"
+// char microd_url[] = "http://your-data-endpoint-d/";
+// char microf_url[] = "http://your-data-endpoint-f/";
+#include "/home/jmoon/Arduino/libraries/local/ssid_harvest.h"
+// #include "/home/jmoon/Arduino/libraries/local/ssid_coleman.h"
 // GAAH! DO NOT USE 'HttpClient.h' - case matters, it's a totally different library!
 #include <HTTPClient.h>
 #include <NTPClient.h>
 #include "src/DateTimeNTP/DateTimeNTP.h"
+
+char nws_tla[] = "ELM"; 
+char second_tla[] = "SHD"; // FIXME - should have this as part of JSON payload
 
 // JFC - yet another Arduino treasure hunt
 // The fonts in Adafruit_GFX library are named exactly the same as in the TFT_eSPI lib, but they are NOT the same or compatible
@@ -29,7 +34,10 @@
 #include "Fonts/FreeMonoBold24pt7b.h"
 #include "Fonts/FreeMonoBold18pt7b.h"
 #include "Fonts/FreeMonoBold12pt7b.h"
+
+// try to import a TFT_eSPI font...
 #include <TFT_eSPI.h>
+#include "Fonts/GFXFF/FreeSans9pt7b.h"
 #include <hardware/pwm.h>
 #include <elapsedMillis.h>
 #include <ArduinoJson.h>
@@ -42,10 +50,17 @@
 // also uncomment line 43 in HTTPClient.h
 #define WEATHERGIZMO_DEBUG 0 // set to non-zero to debug on serial port
 // uncommment this next line if WEATHERGIZMO_DEBUG is not zero
-// #define DEBUG_WEATHERGIZMO(fmt, ...) Serial.printf(fmt, ## __VA_ARGS__ )
+//#define DEBUG_WEATHERGIZMO(fmt, ...) Serial.printf(fmt, ## __VA_ARGS__ )
 #ifndef DEBUG_WEATHERGIZMO
 #define DEBUG_WEATHERGIZMO(...) do { (void)0; } while (0)
 #endif
+
+// needed for formatting forecast screens
+#define SCREEN_WIDTH_CHARS 42
+#define SCREEN_HEIGHT_LINES 20
+int current_forecast_line = 0;
+int forecast_lines = 0;
+int forecast_screen_number = 1; // keep track of how many forecast screens we have shown
 
 //
 // Another Arduino Treasure Hunt:
@@ -63,8 +78,9 @@ TFT_eSPI tft = TFT_eSPI();
 uint8_t backlight_pwm_slice;
 TFT_eSPI_Button forecast_button = TFT_eSPI_Button();
 TFT_eSPI_Button history_button = TFT_eSPI_Button();
+TFT_eSPI_Button local_nws_button = TFT_eSPI_Button();
 
-int status = WL_IDLE_STATUS;     // the Wifi radio's status
+int wifi_status = WL_IDLE_STATUS;     // the Wifi radio's status
 
 WiFiUDP ntpUDP;
 NTPClient theNTPUDPClient(ntpUDP);
@@ -98,7 +114,7 @@ void initial_screen() {
   tft.println(mac_str);
 
   tft.setTextColor(TFT_WHITE);
-  tft.println(httpsGetInsecure(micro_url));
+  tft.println(httpsGetInsecure(microd_url));
 
 }
 
@@ -115,17 +131,23 @@ enum GIZMO_STATES {
   STATE_SHOW_FORECAST,
   STATE_SHOW_MORE_FORECAST,
   STATE_SHOW_HISTORY,
+  STATE_SHOW_LOCAL_NWS,
   STATE_WAIT,
   STATE_WAIT_NEXT,
+  STATE_CHECK_WIFI,
 };
 
 uint8_t gizmo_state;
 
 elapsedMillis awake_millis;
 elapsedMillis update_millis;
+elapsedMillis thp_millis;
+elapsedMillis check_wifi_millis;
 
 uint32_t awake_delay = 60*1000; // ms
-uint32_t update_delay = 2*1000; // ms, for raw sensor data
+uint32_t update_delay = 750; // ms, for faster things (time, wind data) 
+uint32_t thp_delay = 60*1000; // ms, for slower things
+uint32_t check_wifi_delay = 30*1000; // ms
 
 uint8_t dimming_interval = 10; // ms
 uint8_t dimming_levels = 100; // linear walk-down of screen brightness 
@@ -138,6 +160,7 @@ enum BITMAP_NAMES {
   P_CANVAS,
   WINDV_CANVAS,
   WINDA_CANVAS,
+  MSG_CANVAS,
   NUM_BITMAPS
 };
 
@@ -166,7 +189,7 @@ int data_pos[][4] = {
   {LABEL_WIDTH,170 + BANNER_GAP, 320-LABEL_WIDTH,50}, // pressure
   {LABEL_WIDTH,220 + BANNER_GAP, 320-LABEL_WIDTH,50}, // wind v
   {LABEL_WIDTH,270 + BANNER_GAP, 320-LABEL_WIDTH,50}, // wind angle
-  {0,320 + BANNER_GAP,320,50}, // data
+  {0,320 + BANNER_GAP,320 - LABEL_WIDTH,50}, // msg
 };
 
 int label_pos[][4] = {
@@ -177,7 +200,7 @@ int label_pos[][4] = {
   {0,170 + BANNER_GAP,LABEL_WIDTH,50}, // pressure
   {0,220 + BANNER_GAP,LABEL_WIDTH,50}, // wind v
   {0,270 + BANNER_GAP,LABEL_WIDTH,50}, // wind angle
-  {0,320 + BANNER_GAP,320,50}, // data
+  {0,320 + BANNER_GAP,LABEL_WIDTH,50}, // msg
 };
 
 //int canvas_colors[][2] = {
@@ -241,17 +264,22 @@ char wind_angle_labels[][3] = {
 
 GFXcanvas1 *label_canvases[NUM_BITMAPS]; 
 GFXcanvas1 *data_canvases[NUM_BITMAPS]; 
-#define MAX_FORECAST_LEN 256
-char forecasts[8][MAX_FORECAST_LEN];
+
 #define MAX_HISTORY_LEN 128
 char history_data[8][MAX_HISTORY_LEN];
 
 void draw_message(const char *msg) {
-  tft.setCursor(5, 430, 2);
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_RED, TFT_LIGHTGREY,true);  
-  tft.fillRect(0, 400, 175, 40, TFT_DARKGREY);
-  tft.println(msg);
+//  tft.setCursor(5, 430, 2);
+//  tft.setTextFont(2);
+//  tft.setTextColor(TFT_RED, TFT_LIGHTGREY,true);  
+//  tft.fillRect(0, 400, 175, 40, TFT_DARKGREY);
+//  tft.println(msg);
+  label_canvases[MSG_CANVAS]->fillScreen(TFT_BLACK);
+  label_canvases[MSG_CANVAS]->setFont(&FreeMonoBold9pt7b);
+  label_canvases[MSG_CANVAS]->setCursor(5, BANNER_GAP - 10);
+  label_canvases[MSG_CANVAS]->printf(msg);
+  tft.drawBitmap(label_pos[MSG_CANVAS][0],label_pos[MSG_CANVAS][1],label_canvases[MSG_CANVAS]->getBuffer(),label_pos[MSG_CANVAS][2],label_pos[MSG_CANVAS][3],label_canvas_colors[MSG_CANVAS][0],label_canvas_colors[MSG_CANVAS][1]);
+
 }
 
 #include <WiFi.h>
@@ -296,6 +324,31 @@ String httpsGetInsecure(const char* url)
 }
 
 
+///////////////////////////////
+// Checks if wifi is connected and attempts to reconnect if not
+///////////////////////////////
+
+char message_buffer[256];
+
+void check_wifi() {
+
+  wifi_status = WiFi.status();
+
+  // if we are connected don't do anything
+  if (wifi_status != WL_CONNECTED) {
+    while (wifi_status != WL_CONNECTED) {
+      wifi_status = WiFi.begin(local_ssid,local_pass);
+      digitalWrite(PIN_LED, HIGH);
+      delay(100);
+      digitalWrite(PIN_LED, LOW);
+      // wait for connection:
+      delay(1000);
+      sprintf(message_buffer, "Connect wifi status = %d",wifi_status);
+      draw_message(message_buffer);
+    }
+  }
+}
+
 void setup() {
  
   // blink once when setup begins
@@ -309,10 +362,10 @@ void setup() {
   }
 
 // nothing was coming out of pins from scope so had to do this manually
-  gpio_set_function(TFT_CS, GPIO_FUNC_SPI);
-  gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI);
-  gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI);
-  gpio_set_function(TFT_MISO, GPIO_FUNC_SPI);
+//  gpio_set_function(TFT_CS, GPIO_FUNC_SPI);
+//  gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI);
+//  gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI);
+//  gpio_set_function(TFT_MISO, GPIO_FUNC_SPI);
 
   tft.init();
 
@@ -327,13 +380,13 @@ void setup() {
   pwm_set_clkdiv_int_frac(backlight_pwm_slice, BACKLIGHT_DIV, 0); // 133 MHz/255 = 521.6 kHz clock freq
 
   tft.setRotation(2);
-  tft.fillScreen((TFT_BLACK));
+  tft.fillScreen(TFT_BLACK);
 
 
 // DO NOT use the Adafruit_GFX fonts! 
 //  tft.setFreeFont(&FreeSerif9pt7b); 
   tft.setTextFont(2);
-  tft.setTextSize(2);
+  tft.setTextSize(1);
 
 //  tft.setCursor(20, 0, 2);
   tft.setTextColor(TFT_SKYBLUE);
@@ -343,14 +396,28 @@ void setup() {
   tft.setTextColor(TFT_GREEN); 
   tft.println("Hello!");
 
-  tft.setTextColor(TFT_RED); 
+  tft.setTextColor(TFT_RED);
   tft.println("Hello!");
-  
+
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.println("Serif 9pt b");
+
+//  uint8_t ft = 1; 
+//  for (int i=0; i < 256; ++i) {  
+//   tft.setTextFont(i); 
+//   tft.printf("%d-X ",i);
+//  }
+
+  tft.setTextFont(2);
+  tft.setTextSize(2);
+
+  tft.println('\n');
+
   tft.setTextColor(TFT_WHITE);
   tft.println("Connecting"); 
-  while (status != WL_CONNECTED) {
+  while (wifi_status != WL_CONNECTED) {
     // Connect to WPA/WPA2 network:
-    status = WiFi.begin(local_ssid,local_pass);
+    wifi_status = WiFi.begin(local_ssid,local_pass);
     tft.print('.');
     // wait for connection:
     delay(1000);
@@ -370,6 +437,8 @@ void setup() {
 
   update_millis = 0;
   awake_millis = 0;
+  thp_millis = thp_delay;
+  check_wifi_millis = 0;
   pwm_set_chan_level(backlight_pwm_slice, 1, BACKLIGHT_TOP);
 
   char blabel[] = "Forecast"; 
@@ -379,6 +448,14 @@ void setup() {
   char hlabel[] = "History"; 
   history_button.initButton(&tft,70,450,120,50,TFT_SKYBLUE,TFT_BLACK,TFT_SKYBLUE,hlabel,2);
   history_button.drawButton();
+
+  // for the local NWS data
+  char nws_label[] = "NWS     ";
+  sprintf(nws_label,"NWS[%s]",nws_tla);
+
+//  tft.setFreeFont(&FreeMonoBold12pt7b);
+  local_nws_button.initButton(&tft,240,385,150,50,TFT_YELLOW,TFT_BLACK,TFT_SKYBLUE,nws_label,2);
+  local_nws_button.drawButton();
 
   // allocate canvases for rendering
 //  for (int i=0; i < NUM_BITMAPS; ++i) {
@@ -429,6 +506,17 @@ void setup() {
   label_canvases[WINDV_CANVAS]->printf("V(mph)");
 
   draw_labels();
+
+  // fix up microf url
+  char s_width[] = "    "; 
+  sprintf(s_width,"%d",SCREEN_WIDTH_CHARS);
+  size_t len_microf_url = strlen(microf_url);
+  // last two chars are screen width (can't be single or triple digit) - probably should check
+  // but as it is hard coded leave for now
+  microf_url[len_microf_url-2]=s_width[0];
+  microf_url[len_microf_url-1]=s_width[1];
+
+
 }
 
 void draw_labels() {
@@ -436,6 +524,11 @@ void draw_labels() {
       tft.drawBitmap(label_pos[i][0],label_pos[i][1],label_canvases[i]->getBuffer(),label_pos[i][2],label_pos[i][3],label_canvas_colors[i][0],label_canvas_colors[i][1]);
   }
 }
+
+JsonDocument forecast_doc; // buffer size
+JsonDocument doc; // buffer size
+JsonArray forecast_arr;
+
 
 void loop() {
 
@@ -462,11 +555,18 @@ void loop() {
         gizmo_state = STATE_SHOW_HISTORY;
       }
     }
+    else if (local_nws_button.contains(x,y)) {
+      if (!local_nws_button.isPressed()) {
+        local_nws_button.press(true); 
+        local_nws_button.drawButton(true);
+        gizmo_state = STATE_SHOW_LOCAL_NWS;
+      }
+    }
     else if (forecast_button.isPressed() && gizmo_state == STATE_WAIT_NEXT) {
       gizmo_state = STATE_SHOW_MORE_FORECAST;
     }
     else { // transition back to update
-      if (forecast_button.isPressed() || history_button.isPressed()) {
+      if (forecast_button.isPressed() || history_button.isPressed() || local_nws_button.isPressed()) {
         if (gizmo_state == STATE_WAIT || gizmo_state == STATE_DIMMING || gizmo_state == STATE_SLEEP) {
           tft.fillScreen(TFT_BLACK);
           draw_labels();
@@ -475,6 +575,9 @@ void loop() {
         forecast_button.drawButton();
         history_button.press(false);
         history_button.drawButton();
+        local_nws_button.press(false);
+        local_nws_button.drawButton();
+        thp_millis = thp_delay;
         gizmo_state = STATE_UPDATE;
       }
     }
@@ -486,6 +589,10 @@ void loop() {
           gizmo_state = STATE_SLEEP;
         }
       }
+  }
+  else if (check_wifi_millis > check_wifi_delay && gizmo_state != STATE_WAIT && gizmo_state != STATE_WAIT_NEXT) {
+      gizmo_state = STATE_CHECK_WIFI;
+      check_wifi_millis = 0;
   }
   else if (update_millis > update_delay && gizmo_state != STATE_WAIT && gizmo_state != STATE_WAIT_NEXT) {
       gizmo_state = STATE_UPDATE;
@@ -503,7 +610,14 @@ void loop() {
         pwm_set_chan_level(backlight_pwm_slice, 1, screen_level);
         delay(dimming_interval);
       }
-      break;    
+      break;   
+    case STATE_CHECK_WIFI:
+    {
+      check_wifi();
+//      sprintf(message_buffer, "Wifi status = %d",wifi_status);
+//      draw_message(message_buffer);
+      break;
+    } 
     case STATE_UPDATE:
     { // note locally declared variables requiring scope
       // turn screen back on
@@ -524,15 +638,16 @@ void loop() {
       data_canvases[DATE_CANVAS]->printf("%s",dtntp.time_cstring);
       dirty[DATE_CANVAS]=true;
  
-      String sensor_string = httpsGetInsecure(micro_url);
+      String sensor_string = httpsGetInsecure(microd_url);
 //      const int json_cap = 11*JSON_OBJECT_SIZE(3) + JSON_OBJECT_SIZE(11);
 //      StaticJsonDocument<json_cap> doc;
-      DynamicJsonDocument doc(3072); // buffer size
+
       DeserializationError err = deserializeJson(doc,sensor_string.c_str());
       
-//      if(err) {
+      if(err) {
 //          draw_message(err.c_str());
-//      }
+          DEBUG_WEATHERGIZMO(err.c_str());
+      }
 
       if(!doc["wind_angle"]["reading"].isNull() && !doc["wind_vmph"]["reading"].isNull()) {
         float wind_angle = doc["wind_angle"]["reading"];
@@ -563,33 +678,37 @@ void loop() {
         dirty[WINDA_CANVAS]=true;
       }
 
-      data_canvases[T_CANVAS]->fillScreen(TFT_BLACK);
-      data_canvases[T_CANVAS]->setFont(&FreeMonoBold18pt7b);
-      data_canvases[T_CANVAS]->setCursor(5, LABEL_OFFSET); 
-      if(!doc["outside_T_F"].isNull()) {
-        const char* outside_T_F = doc["outside_T_F"];
-        data_canvases[T_CANVAS]->printf("%s",outside_T_F);
-        dirty[T_CANVAS]=true;
-      }
+      if (thp_millis >= thp_delay) {
+        thp_millis = 0;
+        data_canvases[T_CANVAS]->fillScreen(TFT_BLACK);
+        data_canvases[T_CANVAS]->setFont(&FreeMonoBold18pt7b);
+        data_canvases[T_CANVAS]->setCursor(5, LABEL_OFFSET); 
+        if(!doc["outside_T_F"].isNull()) {
+          const char* outside_T_F = doc["outside_T_F"];
+          data_canvases[T_CANVAS]->printf("%s",outside_T_F);
+          dirty[T_CANVAS]=true;
+        }
+        if(!doc["second"])
+        data_canvases[T_CANVAS]->setFont(&FreeSerif9pt7b);
 
-      data_canvases[H_CANVAS]->fillScreen(TFT_BLACK);
-      data_canvases[H_CANVAS]->setFont(&FreeMonoBold18pt7b);
-      data_canvases[H_CANVAS]->setCursor(5, LABEL_OFFSET);
-      if(!doc["outside_H_perc"].isNull()) {
-        const char* outside_H_perc = doc["outside_H_perc"];
-        data_canvases[H_CANVAS]->printf("%s",outside_H_perc);
-        dirty[H_CANVAS]=true;
-      }
+        data_canvases[H_CANVAS]->fillScreen(TFT_BLACK);
+        data_canvases[H_CANVAS]->setFont(&FreeMonoBold18pt7b);
+        data_canvases[H_CANVAS]->setCursor(5, LABEL_OFFSET);
+        if(!doc["outside_H_perc"].isNull()) {
+          const char* outside_H_perc = doc["outside_H_perc"];
+          data_canvases[H_CANVAS]->printf("%s",outside_H_perc);
+          dirty[H_CANVAS]=true;
+        }
 
-      data_canvases[P_CANVAS]->fillScreen(TFT_BLACK);
-      data_canvases[P_CANVAS]->setFont(&FreeMonoBold18pt7b);
-      data_canvases[P_CANVAS]->setCursor(5, LABEL_OFFSET);
-      if (!doc["outside_P_inHg"].isNull()) {
-        const char* outside_P_inHg = doc["outside_P_inHg"];
-        data_canvases[P_CANVAS]->printf("%s",outside_P_inHg);
-        dirty[P_CANVAS]=true;
+        data_canvases[P_CANVAS]->fillScreen(TFT_BLACK);
+        data_canvases[P_CANVAS]->setFont(&FreeMonoBold18pt7b);
+        data_canvases[P_CANVAS]->setCursor(5, LABEL_OFFSET);
+        if (!doc["outside_P_inHg"].isNull()) {
+          const char* outside_P_inHg = doc["outside_P_inHg"];
+          data_canvases[P_CANVAS]->printf("%s",outside_P_inHg);
+          dirty[P_CANVAS]=true;
+        }
       }
-
       for (int i=0; i < NUM_BITMAPS; ++i) {
         if (dirty[i]) {
           dirty[i]=false;
@@ -635,18 +754,7 @@ void loop() {
         sprintf(history_data[6],"Record Wind Gust:\n %s/%s\n",vmph_max_record,(vmph_max_record_dt+2));
       }
 
-      char tag[] = "Forecastx";
-      for (int i=0; i < 8; ++i) {
-        sprintf(tag,"Forecast%d",i);
-        if(!doc[tag].isNull()) {
-          const char* f0 = doc[tag];
-          strncpy(forecasts[i], f0, MAX_FORECAST_LEN-1);
-        }
-        else {
-          strncpy(forecasts[i],"", MAX_FORECAST_LEN-1);
-        }
- 
-      }
+      draw_message("");
 
       break;
 
@@ -657,14 +765,24 @@ void loop() {
       tft.setCursor(0,0);
       GFXcanvas1 forecast_canvas(320,450);
       forecast_canvas.setFont(&FreeSerif9pt7b);
+
+      String sensor_string = httpsGetInsecure(microf_url);
+      DeserializationError err = deserializeJson(forecast_doc,sensor_string.c_str());
+      if(err) {
+//          draw_message(err.c_str());
+          DEBUG_WEATHERGIZMO(err.c_str());
+      }
+
+      forecast_arr = forecast_doc.as<JsonArray>();
+      forecast_lines = forecast_arr.size();
+
       forecast_canvas.setCursor(0, 17);
-      forecast_canvas.println(forecasts[0]);
-      forecast_canvas.println("");
-      forecast_canvas.println(forecasts[1]);
-      forecast_canvas.println("");
-      forecast_canvas.println(forecasts[2]);
-      forecast_canvas.println("");
-      forecast_canvas.println(forecasts[3]);
+
+      forecast_screen_number = 1; // reset to first value
+      for (current_forecast_line=0; current_forecast_line < SCREEN_HEIGHT_LINES && current_forecast_line < forecast_lines; ++current_forecast_line) {
+        forecast_canvas.println(forecast_arr[current_forecast_line].as<const char*>());
+      }
+
       tft.drawBitmap(0,0,forecast_canvas.getBuffer(),320,450,TFT_CYAN,TFT_BLACK);
       // have to transition here
       gizmo_state = STATE_WAIT_NEXT;
@@ -678,17 +796,23 @@ void loop() {
       GFXcanvas1 forecast_canvas(320,450);
       forecast_canvas.setFont(&FreeSerif9pt7b);
       forecast_canvas.setCursor(0, 17);
-      forecast_canvas.println(forecasts[4]);
-      forecast_canvas.println("");
-      forecast_canvas.println(forecasts[5]);
-      forecast_canvas.println("");
-      forecast_canvas.println(forecasts[6]);
-      forecast_canvas.println("");
-      forecast_canvas.println(forecasts[7]);
+
+      forecast_screen_number +=1;
+
+      for (; current_forecast_line < SCREEN_HEIGHT_LINES*forecast_screen_number && current_forecast_line < forecast_lines; ++current_forecast_line) {
+        forecast_canvas.println(forecast_arr[current_forecast_line].as<const char*>());
+      }
+
       tft.drawBitmap(0,0,forecast_canvas.getBuffer(),320,450,TFT_CYAN,TFT_BLACK);
-      // have to transition here
-      gizmo_state = STATE_WAIT;
-      DEBUG_WEATHERGIZMO("Show Forecast %s\n",forecasts[4]);
+      // have to conditionally transition here
+
+      if (current_forecast_line < forecast_lines) {
+        // haven't shown all the lines yet
+        gizmo_state = STATE_WAIT_NEXT; 
+      }
+      else { // done
+        gizmo_state = STATE_WAIT;
+      }
       break;
     }
     case STATE_SHOW_HISTORY:
@@ -706,6 +830,41 @@ void loop() {
       gizmo_state = STATE_WAIT;
       break;
     }
+    case STATE_SHOW_LOCAL_NWS:
+    {
+      tft.fillRect(0, 0, 320, 450, TFT_BLACK);
+      tft.setCursor(0,0);
+      GFXcanvas1 local_nws_canvas(320,450);
+      local_nws_canvas.setFont(&FreeMonoBold12pt7b);
+      local_nws_canvas.setCursor(0, 17);
+      String sensor_string = httpsGetInsecure(microd_url);
+      DeserializationError err = deserializeJson(doc,sensor_string.c_str());
+      if(err) {
+//          draw_message(err.c_str());
+          DEBUG_WEATHERGIZMO(err.c_str());
+      }
+
+      local_nws_canvas.printf("For Location %s:\n\n",nws_tla);
+
+      JsonObject obj = doc.as<JsonObject>();
+      for (JsonPair kv : obj) {
+        const char* key = kv.key().c_str();
+        if (strncmp(key, nws_tla, 3) == 0) {
+          if(strncmp(&(key[4]), "las", 3) == 0) {
+            local_nws_canvas.printf("%s:\n %s\n",&(key[4]), kv.value().as<const char *>());
+          }
+          else {
+            local_nws_canvas.printf("%s:    %s\n",&(key[4]), kv.value().as<const char *>());
+          }
+        }
+      }
+
+      tft.drawBitmap(0,0,local_nws_canvas.getBuffer(),320,450,TFT_CYAN,TFT_BLACK);
+      // have to transition here
+      gizmo_state = STATE_WAIT;
+      break;
+    }
+
     case STATE_WAIT:
       break;
     case STATE_WAIT_NEXT:
