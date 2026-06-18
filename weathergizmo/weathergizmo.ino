@@ -648,6 +648,7 @@ void loop() {
         local_nws_button.press(true); 
         local_nws_button.drawButton(true);
         gizmo_state = STATE_SHOW_LOCAL_NWS;
+
       }
     }
     else if (forecast_button.isPressed() && gizmo_state == STATE_WAIT_NEXT) {
@@ -881,6 +882,7 @@ void loop() {
     }
     case STATE_SHOW_FORECAST:
     {
+      pwm_set_chan_level(backlight_pwm_slice, 1, BACKLIGHT_TOP-1);
       tft.fillRect(0, 0, 320, 450, TFT_BLACK);
       tft.setCursor(0,0);
       GFXcanvas1 forecast_canvas(320,450);
@@ -937,6 +939,7 @@ void loop() {
     }
     case STATE_SHOW_HISTORY:
     {
+      pwm_set_chan_level(backlight_pwm_slice, 1, BACKLIGHT_TOP-1);
       tft.fillRect(0, 0, 320, 450, TFT_BLACK);
       tft.setCursor(0,0);
       GFXcanvas1 history_canvas(320,450);
@@ -952,6 +955,7 @@ void loop() {
     }
     case STATE_SHOW_LOCAL_NWS:
     {
+      pwm_set_chan_level(backlight_pwm_slice, 1, BACKLIGHT_TOP-1);
       int ch = 25;
       tft.fillRect(0, 0, 320, 450, TFT_BLACK);
       tft.setCursor(0,0);
