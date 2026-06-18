@@ -14,6 +14,9 @@
 
 char nws_tla[] = "ELM"; 
 char second_tla[] = "SHD"; // FIXME - should have this as part of JSON payload
+char second_T_F[] = "   _T_F";
+char second_H_perc[] = "   _H_perc";
+
 
 // JFC - yet another Arduino treasure hunt
 // The fonts in Adafruit_GFX library are named exactly the same as in the TFT_eSPI lib, but they are NOT the same or compatible
@@ -28,16 +31,26 @@ char second_tla[] = "SHD"; // FIXME - should have this as part of JSON payload
 // for this reason I implemented deferred drawing of the bitmaps so the touch button would respond reasonably well
 
 #include <SPI.h>
+
 #include <Adafruit_GFX.h>
+// use these fonts in GFXcanvas1 objects
+// As noted below they will compile when used with TFT_eSPI lib functions,
+// BUT THEY WILL NOT WORK
+#include "Fonts/FreeSans9pt7b.h"
+#include "Fonts/FreeSans12pt7b.h"
+#include "Fonts/FreeSans18pt7b.h"
+#include "Fonts/FreeSansBold9pt7b.h"
+#include "Fonts/FreeSansBold12pt7b.h"
+#include "Fonts/FreeSansBold18pt7b.h"
+#include "Fonts/FreeMonoBoldOblique9pt7b.h"
 #include "Fonts/FreeSerif9pt7b.h"
 #include "Fonts/FreeMonoBold9pt7b.h"
-#include "Fonts/FreeMonoBold24pt7b.h"
-#include "Fonts/FreeMonoBold18pt7b.h"
 #include "Fonts/FreeMonoBold12pt7b.h"
+#include "Fonts/FreeMonoBold18pt7b.h"
 
-// try to import a TFT_eSPI font...
 #include <TFT_eSPI.h>
-#include "Fonts/GFXFF/FreeSans9pt7b.h"
+
+
 #include <hardware/pwm.h>
 #include <elapsedMillis.h>
 #include <ArduinoJson.h>
@@ -56,7 +69,7 @@ char second_tla[] = "SHD"; // FIXME - should have this as part of JSON payload
 #endif
 
 // needed for formatting forecast screens
-#define SCREEN_WIDTH_CHARS 42
+#define SCREEN_WIDTH_CHARS 40
 #define SCREEN_HEIGHT_LINES 20
 int current_forecast_line = 0;
 int forecast_lines = 0;
@@ -76,9 +89,59 @@ int forecast_screen_number = 1; // keep track of how many forecast screens we ha
 
 TFT_eSPI tft = TFT_eSPI();
 uint8_t backlight_pwm_slice;
+uint16_t button_width = 140;
+uint16_t button_height = 50;
+
 TFT_eSPI_Button forecast_button = TFT_eSPI_Button();
+uint16_t forecast_button_x = 245;
+uint16_t forecast_button_y = 450;
+
 TFT_eSPI_Button history_button = TFT_eSPI_Button();
+uint16_t history_button_x = 70;
+uint16_t history_button_y = 450;
+
 TFT_eSPI_Button local_nws_button = TFT_eSPI_Button();
+uint16_t local_nws_button_x = forecast_button_x;
+uint16_t local_nws_button_y = 390;
+uint16_t local_nws_button_width = button_width; 
+
+// corresponding bitmaps - the TFT_eSPI_Button is fugly
+GFXcanvas1 *forecast_button_bitmap = new GFXcanvas1(button_width,button_height);
+GFXcanvas1 *history_button_bitmap = new GFXcanvas1(button_width,button_height);
+GFXcanvas1 *local_nws_button_bitmap = new GFXcanvas1(local_nws_button_width,button_height);
+
+// use this rather than the TFT_eSPI buttons drawButton
+void drawButtonCanvas(GFXcanvas1 *canvas, int16_t x, int16_t y, int16_t w, int16_t h,
+                      const char* label, bool pressed) 
+{
+  uint16_t outline = TFT_WHITE;
+  uint16_t fill    = pressed ? TFT_WHITE : TFT_BLUE;
+  uint16_t text    = pressed ? TFT_BLUE  : TFT_WHITE;
+
+  // x and y are the center of the button, but canvases use the upper left point as zero
+  uint16_t ox = x - (w/2);
+  uint16_t oy = y - (h/2);
+  tft.fillRoundRect(ox, oy, w, h, 8, fill);
+  tft.drawRoundRect(ox, oy, w, h, 8, outline);
+
+  canvas->fillScreen(0);
+  canvas->setFont(&FreeSansBold12pt7b);
+  canvas->setTextColor(1);
+
+  int16_t bx, by;
+  uint16_t bw, bh;
+  canvas->getTextBounds(label, 0, 0, &bx, &by, &bw, &bh);
+
+  int16_t cx = (w - bw) / 2 - bx;
+  int16_t cy = (h - bh) / 2 - by;
+
+  canvas->drawRoundRect(0, 0, w, h, 8, text);
+  canvas->setCursor(cx, cy);
+  canvas->print(label);
+
+  tft.drawBitmap(ox, oy, canvas->getBuffer(), w, h, text, fill);
+
+}
 
 int wifi_status = WL_IDLE_STATUS;     // the Wifi radio's status
 
@@ -183,7 +246,7 @@ bool dirty[NUM_BITMAPS];
 
 int data_pos[][4] = {
   {0,0,320,50}, // x, y, w, h; date
-  {0,60,320,BANNER_GAP}, // x, y, w, h; date
+  {0,62,320,BANNER_GAP}, // x, y, w, h; date
   {LABEL_WIDTH,70  + BANNER_GAP, 320-LABEL_WIDTH,50}, // temp
   {LABEL_WIDTH,120 + BANNER_GAP, 320-LABEL_WIDTH,50}, // hum
   {LABEL_WIDTH,170 + BANNER_GAP, 320-LABEL_WIDTH,50}, // pressure
@@ -349,6 +412,11 @@ void check_wifi() {
   }
 }
 
+char blabel[] = "Forecast"; 
+char hlabel[] = "History"; 
+// for the local NWS data
+char nws_label[] = "NWS     ";
+
 void setup() {
  
   // blink once when setup begins
@@ -382,11 +450,12 @@ void setup() {
   tft.setRotation(2);
   tft.fillScreen(TFT_BLACK);
 
+// DO NOT use the Adafruit_GFX fonts with TFT_eSPI functions!
+// They will compile but it does not work
+// Make everything a GFXCanvas1
 
-// DO NOT use the Adafruit_GFX fonts! 
-//  tft.setFreeFont(&FreeSerif9pt7b); 
   tft.setTextFont(2);
-  tft.setTextSize(1);
+  tft.setTextSize(2);
 
 //  tft.setCursor(20, 0, 2);
   tft.setTextColor(TFT_SKYBLUE);
@@ -399,14 +468,25 @@ void setup() {
   tft.setTextColor(TFT_RED);
   tft.println("Hello!");
 
-  tft.setFreeFont(&FreeSans9pt7b);
-  tft.println("Serif 9pt b");
+  // experiment with some fonts
+//  GFXcanvas1 *init_canvas = new GFXcanvas1(320,240);
+//  init_canvas->setCursor(5,20);
+//  init_canvas->setFont(&FreeSans9pt7b);
+//  init_canvas->println("Sans 9pt");
+//  init_canvas->setFont(&FreeMonoBold9pt7b);
+//  init_canvas->println("MonoBold 9pt");
+//  init_canvas->setFont(&FreeSans12pt7b);
+//  init_canvas->println("Sans 12pt");
+//  init_canvas->setFont(&FreeSans18pt7b);
+//  init_canvas->println("Sans 18pt");
+//  init_canvas->setFont(&FreeSansBold9pt7b);
+//  init_canvas->println("Sans Bold 9pt");
+//  init_canvas->setFont(&FreeSansBold12pt7b);
+//  init_canvas->println("Sans Bold 12pt");
+//  init_canvas->setFont(&FreeSansBold18pt7b);
+//  init_canvas->println("Sans Bold 18pt");
+//  tft.drawBitmap(0,240,init_canvas->getBuffer(),320,240,TFT_YELLOW,TFT_BLACK);
 
-//  uint8_t ft = 1; 
-//  for (int i=0; i < 256; ++i) {  
-//   tft.setTextFont(i); 
-//   tft.printf("%d-X ",i);
-//  }
 
   tft.setTextFont(2);
   tft.setTextSize(2);
@@ -441,21 +521,20 @@ void setup() {
   check_wifi_millis = 0;
   pwm_set_chan_level(backlight_pwm_slice, 1, BACKLIGHT_TOP);
 
-  char blabel[] = "Forecast"; 
-  forecast_button.initButton(&tft,250,450,120,50,TFT_SKYBLUE,TFT_BLACK,TFT_SKYBLUE,blabel,2);
-  forecast_button.drawButton();
+  forecast_button.initButton(&tft,forecast_button_x,forecast_button_y,button_width,button_height,TFT_SKYBLUE,TFT_BLACK,TFT_SKYBLUE,blabel,2);
+//  forecast_button.drawButton();
+  drawButtonCanvas(forecast_button_bitmap, forecast_button_x, forecast_button_y, button_width, button_height, blabel, false);
 
-  char hlabel[] = "History"; 
-  history_button.initButton(&tft,70,450,120,50,TFT_SKYBLUE,TFT_BLACK,TFT_SKYBLUE,hlabel,2);
-  history_button.drawButton();
 
-  // for the local NWS data
-  char nws_label[] = "NWS     ";
+  history_button.initButton(&tft,history_button_x,history_button_y,button_width,button_height,TFT_SKYBLUE,TFT_BLACK,TFT_SKYBLUE,hlabel,2);
+  //history_button.drawButton();
+  drawButtonCanvas(history_button_bitmap, history_button_x, history_button_y, button_width, button_height, hlabel, false);
+
+
   sprintf(nws_label,"NWS[%s]",nws_tla);
-
-//  tft.setFreeFont(&FreeMonoBold12pt7b);
-  local_nws_button.initButton(&tft,240,385,150,50,TFT_YELLOW,TFT_BLACK,TFT_SKYBLUE,nws_label,2);
-  local_nws_button.drawButton();
+  local_nws_button.initButton(&tft,local_nws_button_x,local_nws_button_y,local_nws_button_width,button_height,TFT_YELLOW,TFT_BLACK,TFT_SKYBLUE,nws_label,2);
+  //local_nws_button.drawButton();
+  drawButtonCanvas(local_nws_button_bitmap, local_nws_button_x, local_nws_button_y, local_nws_button_width, button_height, nws_label, false);
 
   // allocate canvases for rendering
 //  for (int i=0; i < NUM_BITMAPS; ++i) {
@@ -476,32 +555,38 @@ void setup() {
   label_canvases[DATE_CANVAS]->fillScreen(TFT_BLACK);
 
   label_canvases[BANNER_CANVAS]->fillScreen(TFT_BLACK);
-  label_canvases[BANNER_CANVAS]->setFont(&FreeMonoBold12pt7b);
-  label_canvases[BANNER_CANVAS]->setCursor(5, BANNER_GAP - 10);
+  label_canvases[BANNER_CANVAS]->setFont(&FreeSans12pt7b);
+  // center the banner
+  int16_t bx, by;
+  uint16_t bw, bh;
+  label_canvases[BANNER_CANVAS]->getTextBounds(banner, 0, 0, &bx, &by, &bw, &bh);
+  int16_t cx = (320 - bw) / 2 - bx;
+  int16_t cy = (BANNER_GAP - bh) / 2 - by;
+  label_canvases[BANNER_CANVAS]->setCursor(cx, cy);
   label_canvases[BANNER_CANVAS]->printf(banner);
 
   label_canvases[T_CANVAS]->fillScreen(TFT_BLACK);
-  label_canvases[T_CANVAS]->setFont(&FreeMonoBold18pt7b);
+  label_canvases[T_CANVAS]->setFont(&FreeSansBold18pt7b);
   label_canvases[T_CANVAS]->setCursor(5, LABEL_OFFSET);
   label_canvases[T_CANVAS]->printf("T(F)");
 
   label_canvases[H_CANVAS]->fillScreen(TFT_BLACK);
-  label_canvases[H_CANVAS]->setFont(&FreeMonoBold18pt7b);
+  label_canvases[H_CANVAS]->setFont(&FreeSansBold18pt7b);
   label_canvases[H_CANVAS]->setCursor(5, LABEL_OFFSET);
   label_canvases[H_CANVAS]->printf("H(%%)");
 
   label_canvases[P_CANVAS]->fillScreen(TFT_BLACK);
-  label_canvases[P_CANVAS]->setFont(&FreeMonoBold18pt7b);
+  label_canvases[P_CANVAS]->setFont(&FreeSansBold18pt7b);
   label_canvases[P_CANVAS]->setCursor(5, LABEL_OFFSET);
   label_canvases[P_CANVAS]->printf("P(inHg)");
 
   label_canvases[WINDA_CANVAS]->fillScreen(TFT_BLACK);
-  label_canvases[WINDA_CANVAS]->setFont(&FreeMonoBold18pt7b);
+  label_canvases[WINDA_CANVAS]->setFont(&FreeSansBold18pt7b);
   label_canvases[WINDA_CANVAS]->setCursor(5, LABEL_OFFSET);
   label_canvases[WINDA_CANVAS]->printf("D(deg)");
 
   label_canvases[WINDV_CANVAS]->fillScreen(TFT_BLACK);
-  label_canvases[WINDV_CANVAS]->setFont(&FreeMonoBold18pt7b);
+  label_canvases[WINDV_CANVAS]->setFont(&FreeSansBold18pt7b);
   label_canvases[WINDV_CANVAS]->setCursor(5, LABEL_OFFSET);
   label_canvases[WINDV_CANVAS]->printf("V(mph)");
 
@@ -516,6 +601,9 @@ void setup() {
   microf_url[len_microf_url-2]=s_width[0];
   microf_url[len_microf_url-1]=s_width[1];
 
+  // create keys for second T and H
+  sprintf(second_T_F,"%s_T_F",second_tla);
+  sprintf(second_H_perc,"%s_H_perc",second_tla);
 
 }
 
@@ -572,11 +660,14 @@ void loop() {
           draw_labels();
         }
         forecast_button.press(false);
-        forecast_button.drawButton();
+//        forecast_button.drawButton();
+        drawButtonCanvas(forecast_button_bitmap, forecast_button_x, forecast_button_y, button_width, button_height, blabel, false);
         history_button.press(false);
-        history_button.drawButton();
+//        history_button.drawButton();
+        drawButtonCanvas(history_button_bitmap, history_button_x, history_button_y, button_width, button_height, hlabel, false);
         local_nws_button.press(false);
-        local_nws_button.drawButton();
+//        local_nws_button.drawButton();
+        drawButtonCanvas(local_nws_button_bitmap, local_nws_button_x, local_nws_button_y, local_nws_button_width, button_height, nws_label, false);
         thp_millis = thp_delay;
         gizmo_state = STATE_UPDATE;
       }
@@ -629,8 +720,12 @@ void loop() {
       dtntp.get_date();
 
       data_canvases[DATE_CANVAS]->fillScreen(TFT_BLACK);
-      data_canvases[DATE_CANVAS]->setFont(&FreeMonoBold12pt7b);
-      data_canvases[DATE_CANVAS]->setCursor(30, 16);
+      data_canvases[DATE_CANVAS]->setFont(&FreeSansBold12pt7b);
+      // center the date
+      int16_t bx, by;
+      uint16_t bw, bh;
+      data_canvases[DATE_CANVAS]->getTextBounds(dtntp.date_cstring, 0, 0, &bx, &by, &bw, &bh);
+      data_canvases[DATE_CANVAS]->setCursor((320 - bw) / 2 - bx, 16);
       data_canvases[DATE_CANVAS]->printf("%s\n",dtntp.date_cstring);
       int16_t ycur = data_canvases[DATE_CANVAS]->getCursorY();
       data_canvases[DATE_CANVAS]->setCursor(0, ycur+5);
@@ -638,12 +733,9 @@ void loop() {
       data_canvases[DATE_CANVAS]->printf("%s",dtntp.time_cstring);
       dirty[DATE_CANVAS]=true;
  
-      String sensor_string = httpsGetInsecure(microd_url);
-//      const int json_cap = 11*JSON_OBJECT_SIZE(3) + JSON_OBJECT_SIZE(11);
-//      StaticJsonDocument<json_cap> doc;
-
-      DeserializationError err = deserializeJson(doc,sensor_string.c_str());
-      
+      // this just fetches the wind angle and speed that gets updated every second
+      String sensor_string_v = httpsGetInsecure(microd_url_v);
+      DeserializationError err = deserializeJson(doc,sensor_string_v.c_str());
       if(err) {
 //          draw_message(err.c_str());
           DEBUG_WEATHERGIZMO(err.c_str());
@@ -680,16 +772,35 @@ void loop() {
 
       if (thp_millis >= thp_delay) {
         thp_millis = 0;
+
+        // make second call to get all data
+        String sensor_string = httpsGetInsecure(microd_url);
+        DeserializationError err = deserializeJson(doc,sensor_string.c_str());
+        if(err) {
+//          draw_message(err.c_str());
+            DEBUG_WEATHERGIZMO(err.c_str());
+        }
+
         data_canvases[T_CANVAS]->fillScreen(TFT_BLACK);
         data_canvases[T_CANVAS]->setFont(&FreeMonoBold18pt7b);
         data_canvases[T_CANVAS]->setCursor(5, LABEL_OFFSET); 
         if(!doc["outside_T_F"].isNull()) {
           const char* outside_T_F = doc["outside_T_F"];
           data_canvases[T_CANVAS]->printf("%s",outside_T_F);
+          data_canvases[T_CANVAS]->setFont(&FreeSans9pt7b);
           dirty[T_CANVAS]=true;
         }
-        if(!doc["second"])
-        data_canvases[T_CANVAS]->setFont(&FreeSerif9pt7b);
+        if(!doc[second_T_F].isNull()) {
+          data_canvases[T_CANVAS]->setCursor(110, 18); 
+          data_canvases[T_CANVAS]->setFont(&FreeSans9pt7b);
+          data_canvases[T_CANVAS]->printf("%s",second_tla);
+          data_canvases[T_CANVAS]->setCursor(110, 38); 
+          const char* val_T_F = doc[second_T_F];
+          data_canvases[T_CANVAS]->printf("%s",val_T_F);
+          dirty[T_CANVAS]=true;
+        }
+
+
 
         data_canvases[H_CANVAS]->fillScreen(TFT_BLACK);
         data_canvases[H_CANVAS]->setFont(&FreeMonoBold18pt7b);
@@ -697,6 +808,15 @@ void loop() {
         if(!doc["outside_H_perc"].isNull()) {
           const char* outside_H_perc = doc["outside_H_perc"];
           data_canvases[H_CANVAS]->printf("%s",outside_H_perc);
+          dirty[H_CANVAS]=true;
+        }
+        if(!doc[second_H_perc].isNull()) {
+          data_canvases[H_CANVAS]->setCursor(110, 18); 
+          data_canvases[H_CANVAS]->setFont(&FreeSans9pt7b);
+          data_canvases[H_CANVAS]->printf("%s",second_tla);
+          data_canvases[H_CANVAS]->setCursor(110, 38); 
+          const char* val_H_perc = doc[second_H_perc];
+          data_canvases[H_CANVAS]->printf("%s",val_H_perc);
           dirty[H_CANVAS]=true;
         }
 
@@ -832,11 +952,18 @@ void loop() {
     }
     case STATE_SHOW_LOCAL_NWS:
     {
+      int ch = 25;
       tft.fillRect(0, 0, 320, 450, TFT_BLACK);
       tft.setCursor(0,0);
-      GFXcanvas1 local_nws_canvas(320,450);
-      local_nws_canvas.setFont(&FreeMonoBold12pt7b);
-      local_nws_canvas.setCursor(0, 17);
+      GFXcanvas1 local_nws_canvas(320,ch);
+      local_nws_canvas.setFont(&FreeSansBold12pt7b);
+
+      int16_t bx, by;
+      uint16_t bw, bh;
+      local_nws_canvas.getTextBounds("Test", 0, 0, &bx, &by, &bw, &bh);
+//      int16_t cx = (320 - bw) / 2 - bx;
+      int16_t cy = (ch - bh) / 2 - by;
+
       String sensor_string = httpsGetInsecure(microd_url);
       DeserializationError err = deserializeJson(doc,sensor_string.c_str());
       if(err) {
@@ -844,22 +971,30 @@ void loop() {
           DEBUG_WEATHERGIZMO(err.c_str());
       }
 
-      local_nws_canvas.printf("For Location %s:\n\n",nws_tla);
+      int y=0;
+      local_nws_canvas.setCursor(5, cy);
+      local_nws_canvas.printf("For Location %s: ",nws_tla);
+      tft.drawBitmap(0,y,local_nws_canvas.getBuffer(),320,ch,TFT_YELLOW,TFT_BLACK);
+      y+=ch+3;
 
       JsonObject obj = doc.as<JsonObject>();
       for (JsonPair kv : obj) {
         const char* key = kv.key().c_str();
-        if (strncmp(key, nws_tla, 3) == 0) {
-          if(strncmp(&(key[4]), "las", 3) == 0) {
-            local_nws_canvas.printf("%s:\n %s\n",&(key[4]), kv.value().as<const char *>());
-          }
-          else {
-            local_nws_canvas.printf("%s:    %s\n",&(key[4]), kv.value().as<const char *>());
-          }
+        if (strncmp(key, nws_tla, 3) == 0) { // strip off TLA and '_'
+            local_nws_canvas.fillScreen(TFT_BLACK);
+            local_nws_canvas.setCursor(10, cy);
+            local_nws_canvas.printf("%s:",&(key[4]));
+            tft.drawBitmap(0,y,local_nws_canvas.getBuffer(),320,ch,TFT_YELLOW,TFT_BLACK);
+            y+=ch;
+            local_nws_canvas.fillScreen(TFT_BLACK);
+            local_nws_canvas.setCursor(20, cy);
+            local_nws_canvas.printf("  %s\n",kv.value().as<const char *>());
+            tft.drawBitmap(0,y,local_nws_canvas.getBuffer(),320,ch,TFT_CYAN,TFT_BLACK);
+            y+=(ch+3);
         }
       }
 
-      tft.drawBitmap(0,0,local_nws_canvas.getBuffer(),320,450,TFT_CYAN,TFT_BLACK);
+
       // have to transition here
       gizmo_state = STATE_WAIT;
       break;
